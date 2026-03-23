@@ -310,6 +310,7 @@ typedef struct _CTRL_STATE
 	uint8_t elbowConfig;                                 /* 肘关节配置，0：肘向下配置，1：肘向上配置*/
 	uint8_t wristConfig;                                 /* 腕关节配置，0：腕向下配置，1：腕向上配置*/
 	uint32_t motionCount;                                /* 运动计数 */
+	uint8_t reserved_v386[36];                           /* V3.8.6新增字段，占位以对齐后续数据 */
 	double     flange_cur_pos[6];                     /** 末端法兰当前位姿 */
 	uint16_t endLuaErrCode;                           /** 末端Lua文件异常状态 0-正常；1-异常 */
     uint8_t mdbsSlaveConnect; 						  /** Modbus从站连接状态 0-未连接；1-已连接 */

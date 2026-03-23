@@ -324,8 +324,9 @@ public:
     explicit robot_recv_thread(const std::string node_name);
     ~robot_recv_thread();
 private:
+    std::unique_ptr<FRRobot> _ptr_robot;
     int setKeepAlive(int fd, int idle_time, int interval_time, int probe_times);
-    int _socketfd1;
+    int _socketfd1 = -1;
     std::atomic_bool _reconnect_flag;
     int _robot_recv_exit = 0;           //类即将析构，通知重连线程退出.
     std::thread _reconnect_thread;

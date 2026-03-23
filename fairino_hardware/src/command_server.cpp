@@ -6,6 +6,9 @@
 std::atomic_bool _reconnect_flag;
 std::atomic<int> mainerrcode;
 std::atomic<int> suberrcode;
+std::atomic_bool g_sdk_state_valid(false);
+std::mutex g_sdk_state_mutex;
+ROBOT_STATE_PKG g_sdk_state;
 
 #define LOGGER_NAME "fairino_ros2_command_server"
 
@@ -75,7 +78,6 @@ char* msgout[] = {
     "Parameter fomart:index,x,y,z,r,p,y,please input correct format",
     "Invalid command GET parameter",
     "Illegal command GET parameter,format:[JNT|CART],[index]",
-    "Joint/Cartesean position container index out of range",
     "Forward kinematic error occur,please check input point",
     "Inverse kinematic error occur,please check input point",
     "Invalid container index,can't find the point",
@@ -248,7 +250,6 @@ robot_command_thread::robot_command_thread(const std::string node_name):rclcpp::
 robot_command_thread::~robot_command_thread()
 {
     //_ptr_robot->CloseRPC();
-    _ptr_robot->~FRRobot();
 }
 
 
@@ -376,9 +377,15 @@ void robot_command_thread::_fillJointPose(std::list<std::string>& data,JointPos&
 
 void robot_command_thread::_getRobotRTState(){
     static ROBOT_STATE_PKG tmp;
-    _ptr_robot->GetRobotRealTimeState(&tmp);
-    mainerrcode = tmp.main_code;
-    suberrcode = tmp.sub_code;
+    if(_ptr_robot->GetRobotRealTimeState(&tmp) == 0){
+        {
+            std::lock_guard<std::mutex> lock(g_sdk_state_mutex);
+            g_sdk_state = tmp;
+        }
+        g_sdk_state_valid.store(true);
+        mainerrcode = tmp.main_code;
+        suberrcode = tmp.sub_code;
+    }
 }
 
 
@@ -2563,6 +2570,17 @@ robot_recv_thread::robot_recv_thread(const std::string node_name):rclcpp::Node(n
     _controller_ip = CONTROLLER_IP;//控制器默认ip地址
     RCLCPP_INFO(rclcpp::get_logger(LOGGER_NAME),msgout[msg_id(create_state_feedback)]);
 
+    _ptr_robot = std::make_unique<FRRobot>();
+    _ptr_robot->SetReConnectParam(true,30000,500);
+    error_t sdk_returncode = _ptr_robot->RPC(_controller_ip.c_str());
+    if(sdk_returncode != 0){
+        RCLCPP_WARN(
+            rclcpp::get_logger(LOGGER_NAME),
+            "SDK realtime state connection failed, code=%d; keeping legacy 8081 feedback parser",
+            sdk_returncode
+        );
+    }
+
     //只保留8081端口的连接，8083连接传输的数据已经不用
     _socketfd1 = socket(AF_INET,SOCK_STREAM,0);//状态获取端口只有TCP
 
@@ -2666,23 +2684,23 @@ void robot_recv_thread::_try_to_reconnect(){
     };
 
     _reconnect_thread = std::thread(_reconnect_func);
-    _reconnect_thread.detach();
 }
 
 /**
  * @brief 状态监控节点类的析构函数
  */
 robot_recv_thread::~robot_recv_thread(){
+    _robot_recv_exit = 1;
+
+    if(_reconnect_thread.joinable()){
+        _reconnect_thread.join();
+        RCLCPP_INFO(rclcpp::get_logger(LOGGER_NAME),msgout[msg_id(keep_alive_exit)]);
+    }
+
     //关闭并销毁socket
     if(_socketfd1 != -1){
         shutdown(_socketfd1,SHUT_RDWR);
         close(_socketfd1);
-    }
-
-    _robot_recv_exit = 1;
-    if(_reconnect_thread.joinable()){
-        _reconnect_thread.join();
-        RCLCPP_INFO(rclcpp::get_logger(LOGGER_NAME),msgout[msg_id(keep_alive_exit)]);
     }
 }
 
@@ -2805,7 +2823,6 @@ void robot_recv_thread::_state_recv_callback(){
                 memcpy(ctrl_state_temp_buff,recv_buff,_CTRL_STATE_SIZE);
                 length_left = future_len - recv_length;
                 begin_index = recv_length + 11;
-                //RCLCPP_INFO(rclcpp::get_logger(LOGGER_NAME),"已读取数据长度：%i,剩余长度：%i",recv_length,length_left);
             }
             return;
         }else{//recv_length == *ptr_frame_length
@@ -2833,7 +2850,6 @@ void robot_recv_thread::_state_recv_callback(){
                 memcpy(&ctrl_state_temp_buff[begin_index],concatante_buff,length_concatante);
                 begin_index += length_concatante;
                 length_left -= length_concatante;
-                //RCLCPP_INFO(rclcpp::get_logger(LOGGER_NAME),"已读取拼接数据长度2：%i,剩余长度：%i",length_concatante,length_left);
             }
             return;
         }else{//length_concatante == length_left
@@ -2863,6 +2879,13 @@ void robot_recv_thread::_state_recv_callback(){
         ctrl_state_store_buff.pop();
         auto msg = robot_feedback_msg();
         auto cur_clock = rclcpp::Clock();
+        ROBOT_STATE_PKG sdk_state;
+        bool sdk_state_ok = false;
+        if(g_sdk_state_valid.load()){
+            std::lock_guard<std::mutex> lock(g_sdk_state_mutex);
+            sdk_state = g_sdk_state;
+            sdk_state_ok = true;
+        }
 
         msg.main_error_code = mainerrcode;
         msg.sub_error_code = suberrcode;
@@ -3025,6 +3048,85 @@ void robot_recv_thread::_state_recv_callback(){
         msg.forcesensorerrstate = ctrl_state.forceSensorErrState;
         for(int i=0;i<4;i++){
             msg.ctrlopenluaerrcode[i] = ctrl_state.ctrlOpenLuaErrCode[i];
+        }
+
+        if(sdk_state_ok){
+            msg.main_error_code = sdk_state.main_code;
+            msg.sub_error_code = sdk_state.sub_code;
+
+            msg.robot_motion_done = sdk_state.motion_done ? 1 : 0;
+            msg.robot_mode = sdk_state.robot_mode;
+            msg.emg = sdk_state.EmergencyStop;
+            msg.grip_motion_done = sdk_state.gripper_motiondone;
+
+            msg.j1_cur_pos = sdk_state.jt_cur_pos[0];
+            msg.j2_cur_pos = sdk_state.jt_cur_pos[1];
+            msg.j3_cur_pos = sdk_state.jt_cur_pos[2];
+            msg.j4_cur_pos = sdk_state.jt_cur_pos[3];
+            msg.j5_cur_pos = sdk_state.jt_cur_pos[4];
+            msg.j6_cur_pos = sdk_state.jt_cur_pos[5];
+
+            msg.cart_x_cur_pos = sdk_state.tl_cur_pos[0];
+            msg.cart_y_cur_pos = sdk_state.tl_cur_pos[1];
+            msg.cart_z_cur_pos = sdk_state.tl_cur_pos[2];
+            msg.cart_a_cur_pos = sdk_state.tl_cur_pos[3];
+            msg.cart_b_cur_pos = sdk_state.tl_cur_pos[4];
+            msg.cart_c_cur_pos = sdk_state.tl_cur_pos[5];
+
+            msg.flange_x_cur_pos = sdk_state.flange_cur_pos[0];
+            msg.flange_y_cur_pos = sdk_state.flange_cur_pos[1];
+            msg.flange_z_cur_pos = sdk_state.flange_cur_pos[2];
+            msg.flange_a_cur_pos = sdk_state.flange_cur_pos[3];
+            msg.flange_b_cur_pos = sdk_state.flange_cur_pos[4];
+            msg.flange_c_cur_pos = sdk_state.flange_cur_pos[5];
+
+            msg.work_num = sdk_state.user;
+            msg.tool_num = sdk_state.tool;
+
+            msg.exaxispos1 = sdk_state.extAxisStatus[0].pos;
+            msg.exaxispos2 = sdk_state.extAxisStatus[1].pos;
+            msg.exaxispos3 = sdk_state.extAxisStatus[2].pos;
+            msg.exaxispos4 = sdk_state.extAxisStatus[3].pos;
+
+            msg.j1_cur_tor = sdk_state.jt_cur_tor[0];
+            msg.j2_cur_tor = sdk_state.jt_cur_tor[1];
+            msg.j3_cur_tor = sdk_state.jt_cur_tor[2];
+            msg.j4_cur_tor = sdk_state.jt_cur_tor[3];
+            msg.j5_cur_tor = sdk_state.jt_cur_tor[4];
+            msg.j6_cur_tor = sdk_state.jt_cur_tor[5];
+
+            msg.prg_state = sdk_state.program_state;
+
+            msg.dgt_output_h = sdk_state.cl_dgt_output_h;
+            msg.dgt_output_l = sdk_state.cl_dgt_output_l;
+            msg.tl_dgt_output_l = sdk_state.tl_dgt_output_l;
+            msg.dgt_input_h = sdk_state.cl_dgt_input_h;
+            msg.dgt_input_l = sdk_state.cl_dgt_input_l;
+            msg.tl_dgt_input_l = sdk_state.tl_dgt_input_l;
+
+            msg.ft_fx_data = sdk_state.ft_sensor_data[0];
+            msg.ft_fy_data = sdk_state.ft_sensor_data[1];
+            msg.ft_fz_data = sdk_state.ft_sensor_data[2];
+            msg.ft_tx_data = sdk_state.ft_sensor_data[3];
+            msg.ft_ty_data = sdk_state.ft_sensor_data[4];
+            msg.ft_tz_data = sdk_state.ft_sensor_data[5];
+            msg.ft_actstatus = sdk_state.ft_sensor_active;
+
+            msg.weldbreakoffstate = sdk_state.weldingBreakOffState.breakOffState;
+            msg.weldarcstate = sdk_state.weldingBreakOffState.weldArcState;
+
+            msg.endluaerrcode = sdk_state.endLuaErrCode;
+            msg.collision_err = sdk_state.collisionState ? 1.0 : 0.0;
+
+            msg.mdbsslaveconnect = 0;
+            msg.udpcmdstate = 0;
+            msg.forcesensorerrstate = 0;
+            for(int i=0;i<6;i++){
+                msg.safetyboxsig[i] = 0;
+            }
+            for(int i=0;i<4;i++){
+                msg.ctrlopenluaerrcode[i] = 0;
+            }
         }
 
         _state_publisher->publish(msg);

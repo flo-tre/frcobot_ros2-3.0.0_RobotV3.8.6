@@ -106,6 +106,7 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_activate(const r
 {
     using namespace std::chrono_literals;
     RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "Starting ...please wait...");
+    RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "Controller ip: %s", _controller_ip.c_str());
     //做变量的初始化工作
     _ptr_robot = std::make_unique<FRRobot>();//创建机器人实例
     for(int i=0;i<6;i++){//初始化变量
