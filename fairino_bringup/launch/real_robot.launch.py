@@ -81,7 +81,7 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument("use_sim_time", default_value="false"),
         DeclareLaunchArgument("start_command_server", default_value="false"),
-        DeclareLaunchArgument("trajectory_controller_name", default_value="fairino10_controller"),
+        DeclareLaunchArgument("trajectory_controller_name", default_value="fairino5_controller"),
         control_node,
         fairino_driver,
         delayed_joint_state_broadcaster_spawner,
