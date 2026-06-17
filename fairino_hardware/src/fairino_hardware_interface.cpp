@@ -1,5 +1,10 @@
 #include "fairino_hardware/fairino_hardware_interface.hpp"
 
+#include <algorithm>
+
+using namespace std::chrono_literals;
+
+
 namespace fairino_hardware{
 
 hardware_interface::CallbackReturn FairinoHardwareInterface::on_init(const hardware_interface::HardwareInfo& sysinfo){
@@ -104,7 +109,6 @@ std::vector<hardware_interface::CommandInterface> FairinoHardwareInterface::expo
 
 hardware_interface::CallbackReturn FairinoHardwareInterface::on_activate(const rclcpp_lifecycle::State& previous_state)
 {
-    using namespace std::chrono_literals;
     RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "Starting ...please wait...");
     RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "Controller ip: %s", _controller_ip.c_str());
     //做变量的初始化工作
@@ -118,6 +122,7 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_activate(const r
         _jnt_torque_state[i] = 0;
     }
     _control_mode = 0;//默认是位置控制,0-位置控制，1-扭矩控制 2-速度控制
+    _consecutive_servoj_errors = 0;
     errno_t returncode = _ptr_robot->RPC(_controller_ip.c_str());//建立xmlrpc连接
     rclcpp::sleep_for(200ms);//等待一段时间让控制器的rpc连接建立完毕
     if(returncode != 0){
@@ -134,9 +139,25 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_activate(const r
     因为错误的反馈位置会导致初始指令位置下发出现严重偏差导致事故
     */
     if(returncode == 0){
+        // Ensure robot is in auto mode and clear stale faults from previous sessions.
+        const int mode_rc = _ptr_robot->Mode(0);
+        if (mode_rc != 0) {
+            RCLCPP_WARN(rclcpp::get_logger("FairinoHardwareInterface"),
+                        "Mode(0) returned non-zero during activate: %d", mode_rc);
+        }
+        const int reset_rc = _ptr_robot->ResetAllError();
+        if (reset_rc != 0) {
+            RCLCPP_WARN(rclcpp::get_logger("FairinoHardwareInterface"),
+                        "ResetAllError returned non-zero during activate: %d", reset_rc);
+        }
+
         for(int j=0;j<6;j++){
             _jnt_position_command[j] = jntpos.jPos[j]/180.0*M_PI;
+            _last_jnt_position_command[j] = _jnt_position_command[j];
         }
+        // Lazy-start servo mode on first write(), not here, to avoid spurious 101 errors at startup
+        _servo_mode_started = false;
+        rclcpp::sleep_for(50ms);
         RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"),"初始指令位置: %f,%f,%f,%f,%f,%f",_jnt_position_command[0],\
         _jnt_position_command[1],_jnt_position_command[2],_jnt_position_command[3],_jnt_position_command[4],_jnt_position_command[5]);    
         RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "机械臂硬件启动成功!");
@@ -152,6 +173,16 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_activate(const r
 hardware_interface::CallbackReturn FairinoHardwareInterface::on_deactivate(const rclcpp_lifecycle::State& previous_state)
 {
     RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "Stopping ...please wait...");
+    if (_ptr_robot && _servo_mode_started) {
+        const int end_rc = _ptr_robot->ServoMoveEnd();
+         if (end_rc != 0) {
+            RCLCPP_WARN(
+                rclcpp::get_logger("FairinoHardwareInterface"),
+                "ServoMoveEnd returned non-zero during deactivate: %d", end_rc);
+        }
+        _servo_mode_started = false;
+        _consecutive_servoj_errors = 0;
+    }
     _ptr_robot->StopMotion();//停止机器人
     _ptr_robot->CloseRPC();//销毁实例，连接断开
     _ptr_robot.release();
@@ -171,7 +202,7 @@ hardware_interface::return_type FairinoHardwareInterface::read(const rclcpp::Tim
             //_jnt_torque_state[i] = state_data.jt_cur_tor[i];//注意单位转换
         }
     }else{
-        hardware_interface::return_type::ERROR;
+        return hardware_interface::return_type::ERROR;
     }
     //RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "System successfully read: %f,%f,%f,%f,%f,%f",_jnt_position_state[0],\
     _jnt_position_state[1],_jnt_position_state[2],_jnt_position_state[3],_jnt_position_state[4],_jnt_position_state[5]);
@@ -183,23 +214,104 @@ hardware_interface::return_type FairinoHardwareInterface::read(const rclcpp::Tim
 hardware_interface::return_type FairinoHardwareInterface::write(const rclcpp::Time& time,const rclcpp::Duration& period)
 {
     if(_control_mode == 0){//位置控制模式
-        if (std::any_of(&_jnt_position_command[0], &_jnt_position_command[5],\
+        if (std::any_of(&_jnt_position_command[0], &_jnt_position_command[6],\
             [](double c) { return not std::isfinite(c); })) {
             return hardware_interface::return_type::ERROR;
         }
+
+        if (!_servo_mode_started) {
+            const int start_rc = _ptr_robot->ServoMoveStart();
+            if (start_rc != 0) {
+                RCLCPP_ERROR(
+                    rclcpp::get_logger("FairinoHardwareInterface"),
+                    "ServoMoveStart failed in write(), error code: %d", start_rc);
+                return hardware_interface::return_type::ERROR;
+            }
+            _servo_mode_started = true;
+        }
+
         JointPos cmd;
         ExaxisPos extcmd{0,0,0,0};
+        double max_abs_delta = 0.0;
         for(auto j=0;j<6;j++){
+            max_abs_delta = std::max(max_abs_delta, std::abs(_jnt_position_command[j] - _jnt_position_state[j]));
             cmd.jPos[j] = _jnt_position_command[j]/M_PI*180; //注意单位转换
         }
+
+        // No effective movement command: avoid sending redundant idle ServoJ packets.
+        if (max_abs_delta < 1e-5) {
+            _consecutive_servoj_errors = 0;
+            return hardware_interface::return_type::OK;
+        }
+
+        // ServoJ SDK recommends cmdT in [0.001, 0.0016] seconds.
+        (void)period;
+        const float cmd_t = 0.0016f;
+
         //RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "ServoJ下发位置:%f,%f,%f,%f,%f,%f",\
             cmd.jPos[0],cmd.jPos[1],cmd.jPos[2],cmd.jPos[3],cmd.jPos[4],cmd.jPos[5]);
-        int returncode = _ptr_robot->ServoJ(&cmd,&extcmd,0,0,0.008,0,0);
-        if(returncode != 0){
-            RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "ServoJ指令下发错误,错误码:%d",returncode);
+        int returncode = _ptr_robot->ServoJ(&cmd,&extcmd,0,0,cmd_t,0,0);
+
+        if(returncode == 101){
+            int main_error = 0;
+            int sub_error = 0;
+            (void)_ptr_robot->GetRobotErrorCode(&main_error, &sub_error);
+            RCLCPP_WARN(
+                rclcpp::get_logger("FairinoHardwareInterface"),
+                "ServoJ returned 101 (main=%d, sub=%d), resetting fault and retrying once",
+                main_error, sub_error);
+
+            const int reset_rc = _ptr_robot->ResetAllError();
+            if (reset_rc != 0) {
+                RCLCPP_WARN(
+                    rclcpp::get_logger("FairinoHardwareInterface"),
+                    "ResetAllError during recovery returned: %d", reset_rc);
+            }
+
+            const int end_rc = _ptr_robot->ServoMoveEnd();
+            if (end_rc != 0) {
+                RCLCPP_WARN(
+                    rclcpp::get_logger("FairinoHardwareInterface"),
+                    "ServoMoveEnd during recovery returned: %d", end_rc);
+            }
+            _servo_mode_started = false;
+            rclcpp::sleep_for(20ms);
+            const int start_rc = _ptr_robot->ServoMoveStart();
+            if (start_rc == 0) {
+                _servo_mode_started = true;
+                rclcpp::sleep_for(20ms);
+                returncode = _ptr_robot->ServoJ(&cmd,&extcmd,0,0,cmd_t,0,0);
+            } else {
+                RCLCPP_ERROR(
+                    rclcpp::get_logger("FairinoHardwareInterface"),
+                    "ServoMoveStart recovery failed, error code: %d", start_rc);
+                returncode = start_rc;
+            }
         }
+
+        if(returncode != 0){
+            ++_consecutive_servoj_errors;
+            RCLCPP_ERROR(
+                rclcpp::get_logger("FairinoHardwareInterface"),
+                "ServoJ指令下发错误,错误码:%d, consecutive_errors:%d",
+                returncode, _consecutive_servoj_errors);
+
+            // Keep interfaces available on transient servo faults; fail hard only if persistent.
+            for (int i = 0; i < 6; ++i) {
+                _jnt_position_command[i] = _jnt_position_state[i];
+            }
+            if (_consecutive_servoj_errors >= 25) {
+                RCLCPP_ERROR(
+                    rclcpp::get_logger("FairinoHardwareInterface"),
+                    "ServoJ errors persisted for %d cycles, returning ERROR to ros2_control",
+                    _consecutive_servoj_errors);
+                return hardware_interface::return_type::ERROR;
+            }
+            return hardware_interface::return_type::OK;
+        }
+        _consecutive_servoj_errors = 0;
     }else if(_control_mode == 1){//扭矩控制模式
-        if (std::any_of(&_jnt_torque_command[0], &_jnt_torque_command[5],\
+        if (std::any_of(&_jnt_torque_command[0], &_jnt_torque_command[6],\
             [](double c) { return not std::isfinite(c); })) {
             return hardware_interface::return_type::ERROR;
         }

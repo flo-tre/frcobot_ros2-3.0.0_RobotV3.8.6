@@ -60,6 +60,10 @@ private:
   int _control_mode;
   std::string _controller_ip = CONTROLLER_IP;
   std::unique_ptr<FRRobot> _ptr_robot;
+  bool _servo_mode_started{false};
+  int _consecutive_servoj_errors{0};
+  double _last_jnt_position_command[6]{0};
+  double _position_change_threshold{0.001};  // radians - minimum change to trigger write
 };
 
 } //end namespace
